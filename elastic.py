@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 from bs4 import BeautifulSoup
-from elasticsearch_dsl import Document, Field, Float, Integer, Keyword, Object, Text
-from elasticsearch_dsl.connections import connections
 import re
 import os
+import datetime
+import json
+import sqlite3
+from unittest.mock import Mock
 
 
 def main():
-    connections.create_connection(hosts=['localhost'])
-    Doc.init()
 
     for dir_name in sorted(os.listdir('data')):
         for file_name in sorted(os.listdir(f'data/{dir_name}/')):
@@ -93,6 +93,10 @@ def main():
             if dir_name in parse_functions:
                 parse_functions[dir_name](id, soup)
 
+    timestamp = int(datetime.datetime.utcnow().timestamp())
+    write_json(timestamp)
+    write_database(timestamp)
+
 
 def build_url(category: str, id: int, params: [str] = []) -> str:
     return f'{category}.aspx?' + '&'.join([f"ID={id}"] + params)
@@ -105,7 +109,7 @@ def parse_generic(id: str, soup: BeautifulSoup, category: str, url: str, type: s
     source = get_label_text(soup, 'Source')
 
     doc = Doc()
-    doc.meta.id = category + '-' + id
+    doc.meta_id = category + '-' + id
     doc.id = id
     doc.url = build_url(url, id, url_params)
     doc.category = category
@@ -446,7 +450,7 @@ def parse_equipment(id: str, soup: BeautifulSoup):
             price = get_label_text(sub_title, 'Price')
             traits = get_traits(sub_title) or get_traits(soup)
 
-            doc.meta.id = 'equipment-' + id + '-' + str(idx)
+            doc.meta_id = 'equipment-' + id + '-' + str(idx)
             doc.name = name
             doc.type = type
             doc.level = level
@@ -1452,65 +1456,166 @@ def all_types():
     return ['all'] + physical_types() + energy_types() + alignment_types() + material_types() + other_types()
 
 
-class Alias(Field):
-    name = "alias"
+class Doc(Mock):
+    saved = []
+
+    def save(self):
+        Doc.saved.append({
+            k: getattr(self, k)
+            for k in dir(self)
+            if k not in dir(Doc)
+        })
 
 
-def damageTypesObject():
-    fields = {}
-    for type in all_types():
-        fields[type] = Integer()
+JSON_PATH = 'nethys.json'
+DB_PATH = 'nethys.db'
+RE_NOT_ALPHANUM = re.compile(r'[^a-zA-Z0-9_-]')
+COL_TYPES = {
+    str: 'TEXT',
+    bytes: 'TEXT',
+    int: 'INTEGER',
+    float: 'REAL',
+    bool: 'INTEGER'
+}
 
-    return Object(properties=fields)
+TYPE_PRIORITY = {
+    'TEXT': 3,
+    'REAL': 2,
+    'INTEGER': 1,
+    None: 0
+}
 
 
-class Doc(Document):
-    ac = Integer()
-    bulk = Float()
-    category = Keyword(normalizer="lowercase")
-    cha = Alias(path="charisma")
-    charisma = Integer()
-    check_penalty = Integer()
-    con = Alias(path="constitution")
-    constitution = Integer()
-    dex = Alias(path="dexterity")
-    dex_cap = Integer()
-    dexterity = Integer()
-    fort = Alias(path="fortitude_save")
-    fortitude = Alias(path="fortitude_save")
-    fortitude_save = Integer()
-    hardness = Integer()
-    hp = Integer()
-    id = Integer()
-    int = Alias(path="intelligence")
-    intelligence = Integer()
-    level = Integer()
-    per = Alias(path="perception")
-    perception = Integer()
-    price = Integer()
-    range = Integer()
-    ref = Alias(path="reflex_save")
-    reflex = Alias(path="reflex_save")
-    reflex_save = Integer()
-    reload = Integer()
-    required_abilities = Integer()
-    resistance = damageTypesObject()
-    secondary_casters = Integer()
-    source = Keyword(normalizer="lowercase")
-    str = Alias(path="strength")
-    strength = Integer()
-    text = Text()
-    trait = Keyword(normalizer="lowercase")
-    type = Keyword(normalizer="lowercase")
-    url = Keyword()
-    weakness = damageTypesObject()
-    will = Alias(path="will_save")
-    will_save = Integer()
-    wis = Alias(path="wisdom")
-    wisdom = Integer()
+def strify(s):
+    if isinstance(s, str):
+        return s
 
-    class Index:
-        name = 'aon'
+    if isinstance(s, bytes):
+        return s.decode('ascii')
+
+    if isinstance(s, list):
+        return ', '.join(strify(e) for e in s)
+
+    return repr(s)
+
+
+def write_json(timestamp):
+    if os.path.isfile(JSON_PATH):
+        tokens = JSON_PATH.rsplit('.', 1)
+        tokens[0] = f'{tokens[0]}-{timestamp}'
+        new_path = '.'.join(tokens)
+        print(f'Moving existing JSON to "{new_path}"...')
+        os.rename(JSON_PATH, new_path)
+
+    print(f'Writing new JSON to "{JSON_PATH}"...')
+    with open(JSON_PATH, 'w') as f:
+        json.dump(
+            obj=Doc.saved,
+            fp=f,
+            indent=4,
+            sort_keys=True)
+
+
+def write_database(timestamp):
+    print('Generating table columns...')
+    tables = {'generic': {'columns': {}, 'rows': []}}
+    for doc in Doc.saved:
+        # derive table name from the type attribute
+        table_name = doc.get('type', 'generic')
+        if not isinstance(table_name, str):
+            raise Exception(f'Non-string doc type "{table_name}"')
+
+        table_name = RE_NOT_ALPHANUM.sub('', table_name).replace('-', '_').lower()
+        table = tables.get(table_name, {'columns': {}, 'rows': []})
+        tables[table_name] = table
+
+        columns = table['columns']
+        rows = table['rows']
+        row = {}
+        rows.append(row)
+
+        for k, v in doc.items():
+            if k == 'type':
+                continue
+
+            # derive column name and type from the key/val pair
+            col_name = RE_NOT_ALPHANUM.sub('', k).replace('-', '_')
+            col_type = None
+            if v is not None:
+                col_type = COL_TYPES.get(type(v), 'TEXT')
+
+            # add the raw value to the row (processed later)
+            row[col_name] = v
+
+            # add the column to the generic table
+            generic_existing = tables['generic']['columns'].get(col_name)
+            if generic_existing is None or TYPE_PRIORITY[generic_existing] < TYPE_PRIORITY[col_type]:
+                tables['generic']['columns'][col_name] = col_type
+
+            if table_name == 'generic':
+                continue
+
+            # add the column to the type table
+            existing = columns.get(col_name)
+            if existing is None or TYPE_PRIORITY[existing] < TYPE_PRIORITY[col_type]:
+                columns[col_name] = col_type
+
+    print('Processing table rows...')
+    for table_name, table in tables.items():
+        for row in table['rows']:
+            for k, v in row.items():
+                if v is None:
+                    continue
+
+                col_type = table['columns'][k]
+                if col_type == 'TEXT':
+                    row[k] = strify(v)
+                    continue
+
+                if col_type == 'INTEGER':
+                    row[k] = int(v)
+                    continue
+
+                if col_type == 'REAL':
+                    row[k] = float(v)
+                    continue
+
+                raise Exception(f'Unexpected column type: {col_type}')
+
+    if os.path.isfile(DB_PATH):
+        tokens = DB_PATH.rsplit('.', 1)
+        tokens[0] = f'{tokens[0]}-{timestamp}'
+        new_path = '.'.join(tokens)
+        print(f'Moving existing database to "{new_path}"...')
+        os.rename(DB_PATH, new_path)
+
+    print(f'Writing new database to "{DB_PATH}"...')
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        uid = 0
+        for table_name, table in tables.items():
+            col_names = sorted(table['columns'].keys())
+            col_specs = ', '.join(
+                f'{col_name} {table["columns"][col_name]}'
+                for col_name in col_names)
+
+            vals = []
+            for row in table['rows']:
+                vals.append((uid,) + tuple(
+                    row.get(col_name)
+                    for col_name in col_names))
+
+                uid += 1
+
+            qmarks = ', '.join('?' * (len(col_names) + 1))
+            cur.execute(f'CREATE TABLE {table_name} (uid INTEGER PRIMARY KEY, {col_specs})')
+            cur.executemany(f'INSERT INTO {table_name} VALUES ({qmarks})', vals)
+
+        con.commit()
+
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
